@@ -26,6 +26,14 @@
 
 #include "MAVLink.h"
 
+#include <cmath>
+#include <Wire.h>
+
+// MPU6050 I2C address and registers
+#define MPU6050_ADDR 0x68
+#define MPU6050_PWR_MGMT_1 0x6B
+#define MPU6050_GYRO_YOUT_H 0x45
+
 #if defined(PLATFORM_ESP32_S3)
 #include "USB.h"
 #define USBSerial Serial
@@ -72,6 +80,26 @@ static enum { stbIdle, stbRequested, stbBoosting } syncTelemBoostState = stbIdle
 volatile uint32_t LastTLMpacketRecvMillis = 0;
 uint32_t TLMpacketReported = 0;
 static bool commitInProgress = false;
+static uint32_t standaloneActivationTime = 0;  // Track when to activate standalone mode
+static uint32_t standaloneConnectionTime = 0;  // Track when to complete standalone connection
+
+#define THROTTLE_POT_PIN 32  // GPIO32 for potentiometer input
+#define JOYSTICK_X_PIN 33    // GPIO33 for joystick X-axis (yaw)
+#define JOYSTICK_Y_PIN 34    // GPIO34 for joystick Y-axis (pitch)
+#define AUX1_SWITCH_PIN 25   // GPIO25 for AUX1 toggle switch
+#define MPU6050_SDA_PIN 2    // GPIO2 for MPU6050 SDA (I2C data)
+#define MPU6050_SCL_PIN 22   // GPIO22 for MPU6050 SCL (I2C clock)
+// #define JOYSTICK_DEADBAND 50 // Deadband range around center (out of 4095)
+
+// Forward declaration
+// uint32_t computeYaw(int joystickX);
+void UpdateChannelsFromPotentiometer();
+void initMPU6050();
+int16_t readMPU6050GyroY();
+
+// MPU6050 variables
+static bool mpu6050Initialized = false;
+static int16_t gyroYOffset = 0;
 
 LQCALC<25> LQCalc;
 
@@ -606,6 +634,12 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
       NextPacketIsMspData = true;
 
       injectBackpackPanTiltRollData(now);
+      
+      // Update channel data from potentiometer right before packing for transmission
+      if (connectionState >= connected) {
+        UpdateChannelsFromPotentiometer();
+      }
+      
       OtaPackChannelData(&otaPkt, ChannelData, TelemetryReceiver.GetCurrentConfirm(), ExpressLRS_currTlmDenom);
     }
   }
@@ -1409,6 +1443,176 @@ static void cyclePower()
   }
 }
 
+void UpdateChannelsFromPotentiometer()
+{
+  // Read potentiometer and joystick values (0-4095 on ESP32)
+  int potValue = analogRead(THROTTLE_POT_PIN);
+  int joystickX = analogRead(JOYSTICK_X_PIN);  // X-axis for yaw
+  int joystickY = analogRead(JOYSTICK_Y_PIN);  // Y-axis for pitch
+  
+  // Read AUX1 switch (digital input, HIGH = armed, LOW = disarmed)
+  bool aux1Switch = digitalRead(AUX1_SWITCH_PIN);
+  
+  // Map potentiometer value to CRSF range for throttle (172-1811)
+  uint32_t throttleValue = map(potValue, 0, 4095, 172, 1811);
+
+  int JOYSTICK_MIDDLE = 2047; // Middle value for joystick (0-4095 range)
+  int JOYSTICK_DEADZONE = 300; // Deadzone for joystick input
+  int JOYSTICK_DAMPING = 300; // Damping for joystick input
+
+  uint32_t yawValue = CRSF_CHANNEL_VALUE_MID;
+  if (abs(joystickX - JOYSTICK_MIDDLE) > JOYSTICK_DEADZONE) {
+    yawValue = map(joystickX, 0, 4095, 1811-JOYSTICK_DAMPING+100, 172+JOYSTICK_DAMPING-100);    // X-axis controls yaw (inverted)
+  }
+
+  uint32_t pitchValue = CRSF_CHANNEL_VALUE_MID;
+  if (abs(joystickY - JOYSTICK_MIDDLE) > JOYSTICK_DEADZONE) {
+    pitchValue = map(joystickY, 0, 4095, 1811-JOYSTICK_DAMPING, 172+JOYSTICK_DAMPING);  // Y-axis controls pitch (inverted)
+  }
+
+  // Roll control from gyro Y-axis (continuous)
+  uint32_t rollValue = CRSF_CHANNEL_VALUE_MID; // Default to center
+  if (mpu6050Initialized) {
+    int16_t currentGyroY = readMPU6050GyroY();
+    int16_t gyroDelta = currentGyroY - gyroYOffset;
+    
+    // Map gyro delta to roll channel (adjust sensitivity as needed)
+    // Typical gyro range is about ±32768, but we'll use a smaller range for sensitivity
+    int rollDelta = map(constrain(gyroDelta, -4000, 4000), -4000, 4000, -400, 400);
+    rollValue = constrain(CRSF_CHANNEL_VALUE_MID + rollDelta, 172, 1811);
+  }
+
+  // Set AUX1 value based on switch position
+  uint32_t aux1Value = !aux1Switch ? 172 : 1811;  // HIGH = armed (1811), LOW = disarmed (172)
+  
+  // Debug output every 1000ms
+  static uint32_t lastDebug = 0;
+  if (millis() - lastDebug > 1000) {
+    if (mpu6050Initialized) {
+      int16_t currentGyroY = readMPU6050GyroY();
+      DBGLN("GyroY: %d, Offset: %d, Delta: %d, Roll: %d | Thr: %d, Pitch: %d, Yaw: %d", 
+            currentGyroY, gyroYOffset, currentGyroY - gyroYOffset, rollValue, throttleValue, pitchValue, yawValue);
+    } else {
+      DBGLN("Pot: %d->Thr: %d, JoyX: %d->Yaw: %d, JoyY: %d->Pitch: %d, AUX1: %s", 
+            potValue, throttleValue, joystickX, yawValue, joystickY, pitchValue, aux1Switch ? "ARMED" : "DISARMED");
+    }
+    lastDebug = millis();
+  }
+  
+  // Set channels - AETR layout (Aileron, Elevator, Throttle, Rudder)
+  ChannelData[0] = rollValue;               // Roll/Aileron from gyro Y-axis
+  ChannelData[1] = pitchValue;              // Pitch/Elevator from joystick Y
+  ChannelData[2] = throttleValue;           // Throttle from potentiometer
+  ChannelData[3] = yawValue;                // Yaw/Rudder from joystick X
+  ChannelData[4] = aux1Value;               // AUX1 from toggle switch
+  
+  // Set remaining channels to center
+  for (int i = 5; i < CRSF_NUM_CHANNELS; i++) {
+    ChannelData[i] = CRSF_CHANNEL_VALUE_MID;
+  }
+}
+
+// MPU6050 Functions
+void initMPU6050()
+{
+  // Try to initialize MPU6050 with error handling
+  Wire.begin(MPU6050_SDA_PIN, MPU6050_SCL_PIN);
+  Wire.setClock(100000); // Set I2C clock to 100kHz (slower, more reliable)
+  
+  // Test communication first
+  Wire.beginTransmission(MPU6050_ADDR);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    DBGLN("MPU6050 not found, gyro disabled (error: %d)", error);
+    mpu6050Initialized = false;
+    return;
+  }
+  
+  // Wake up the MPU6050
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(MPU6050_PWR_MGMT_1);
+  Wire.write(0x00);
+  error = Wire.endTransmission();
+  
+  if (error != 0) {
+    DBGLN("MPU6050 wake-up failed, gyro disabled (error: %d)", error);
+    mpu6050Initialized = false;
+    return;
+  }
+  
+  delay(100); // Let MPU6050 stabilize
+  
+  // Read initial gyro Y value for offset calibration
+  gyroYOffset = readMPU6050GyroY();
+  mpu6050Initialized = true;
+  
+  DBGLN("MPU6050 initialized successfully, gyroY offset: %d", gyroYOffset);
+}
+
+int16_t readMPU6050GyroY()
+{
+  if (!mpu6050Initialized) return 0;
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(MPU6050_GYRO_YOUT_H);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) return 0;
+  
+  Wire.requestFrom(MPU6050_ADDR, 2);
+  if (Wire.available() >= 2) {
+    int16_t gyroY = (Wire.read() << 8) | Wire.read();
+    return gyroY;
+  }
+  return 0;
+}
+
+// float fmap(float x, float in_min, float in_max, float out_min, float out_max) {
+//     if (in_max == in_min) return out_min;  // avoid divide-by-zero
+//     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+// }
+
+// uint32_t computeYaw(uint16_t joystickX) {
+//     // 1. Normalize joystick input
+//     float joyNorm = fmap((float)joystickX, 0.0f, 4095.0f, -1.0f, 1.0f);
+
+//     // // 2. Apply deadzone
+//     // const float deadzone = 0.05;  // 5% deadzone
+//     // if (std::abs(joyNorm) < deadzone) {
+//     //     joyNorm = 0.0;
+//     // } else {
+//     //     // Optional: scale remaining values to use full range after deadzone
+//     //     joyNorm = (joyNorm > 0)
+//     //         ? fmap(joyNorm, deadzone, 1.0, 0.0, 1.0)
+//     //         : fmap(joyNorm, -deadzone, -1.0, 0.0, -1.0);
+//     // }
+
+//     // 3. Apply non-linear cubic curve
+//     float curved = std::pow(joyNorm, 3);
+
+//     // 4. Map to output range
+//     float yawF = fmap(curved, -1.0, 1.0, 1811.0, 172.0);
+
+//     return (uint32_t)lroundf(yawF);
+//     // return (uint32_t)1600.5;
+//     // return 1600;
+// }
+
+// uint32_t computeYaw(int joystickX) {
+//     float joyNorm = fmap((float)joystickX, 0.0f, 4095.0f, -1.0f, 1.0f);
+//     // float curved = std::pow(joyNorm, 3);
+//     float yawF = fmap(joyNorm, -1.0f, 1.0f, 1811.0f, 172.0f);
+
+//     // if (isnan(yawF) || isinf(yawF) || yawF < 0.0f || yawF > 3000.0f) {
+//     //     Serial.println("Yaw value out of range or invalid");
+//     //     return 1600;
+//     // }
+
+//     return (uint32_t)lroundf(yawF);
+//     // return (uint32_t)lroundf(yawF);
+// }
+
 void setup()
 {
   if (setupHardwareFromOptions())
@@ -1466,12 +1670,26 @@ void setup()
 
       // Set the pkt rate, TLM ratio, and power from the stored eeprom values
       ChangeRadioParams();
+      
+      // Very quick standalone mode activation
+      standaloneActivationTime = millis() + 50;
+      
+      // Initialize potentiometer, joystick pins, and AUX1 switch
+      pinMode(THROTTLE_POT_PIN, INPUT);
+      pinMode(JOYSTICK_X_PIN, INPUT);
+      pinMode(JOYSTICK_Y_PIN, INPUT);
+      pinMode(AUX1_SWITCH_PIN, INPUT_PULLUP);  // Use internal pullup for switch
+      analogSetAttenuation(ADC_11db);  // Set ADC range to 0-3.3V
 
   #if defined(Regulatory_Domain_EU_CE_2400)
       SetClearChannelAssessmentTime();
   #endif
       hwTimer::init(nullptr, timerCallback);
       connectionState = noCrossfire;
+      
+      // Initialize MPU6050 after radio is set up (delay to avoid interference)
+      delay(1000);
+      initMPU6050();
     }
   }
   else
@@ -1501,6 +1719,36 @@ void loop()
   uint32_t now = millis();
 
   HandleUARTout(); // Only used for non-CRSF output
+
+  // Check if we should activate standalone mode
+  if (standaloneActivationTime != 0 && now >= standaloneActivationTime && connectionState == noCrossfire)
+  {
+    // Enter binding mode to establish RF connection
+    DBGLN("Quick binding for standalone mode");
+    EnterBindingMode();
+    
+    // Short binding phase - 300ms should be enough
+    standaloneConnectionTime = now + 300;
+    standaloneActivationTime = 0;  // Only do this once
+  }
+  
+  // Exit binding mode and establish 250Hz connection
+  if (standaloneConnectionTime != 0 && now >= standaloneConnectionTime && InBindingMode)
+  {
+    // Exit binding mode which will call UARTconnected() and establish normal operation
+    ExitBindingMode();
+    
+    // Set to 250Hz after exiting binding
+    config.SetRate(RATE_LORA_250HZ);
+    SetRFLinkRate(RATE_LORA_250HZ);
+    
+    // Simulate having a model match and telemetry
+    connectionHasModelMatch = true;
+    LastTLMpacketRecvMillis = now;
+    
+    standaloneConnectionTime = 0;  // Only do this once
+    DBGLN("Fast standalone 250Hz mode established");
+  }
 
   #if defined(USE_BLE_JOYSTICK)
   if (connectionState != bleJoystick && connectionState != noCrossfire) // Wait until the correct crsf baud has been found
